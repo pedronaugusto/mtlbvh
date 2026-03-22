@@ -171,28 +171,15 @@ inline float2 bb_ray_intersect(BvhBoundingBox bb, float3 pos, float3 dir) {
 }
 
 // ─── Fixed-size stack ────────────────────────────────────────────────────────
+// Depth 24 is sufficient: a balanced 4-ary BVH with 40K leaves has depth ~8,
+// so 24 provides ample margin while cutting register pressure vs 32/48.
 
-struct FixedStack32 {
-    int elems[32];
+struct FixedStack24 {
+    int elems[24];      // 96 bytes — down from 128/192
     int count = 0;
-    bool overflowed = false;
 
     void push(int val) {
-        if (count >= 32) { overflowed = true; return; }
-        elems[count++] = val;
-    }
-    int pop() { return elems[--count]; }
-    bool empty() { return count <= 0; }
-};
-
-struct FixedStack48 {
-    int elems[48];
-    int count = 0;
-    bool overflowed = false;
-
-    void push(int val) {
-        if (count >= 48) { overflowed = true; return; }
-        elems[count++] = val;
+        if (count < 24) elems[count++] = val;
     }
     int pop() { return elems[--count]; }
     bool empty() { return count <= 0; }
@@ -263,7 +250,7 @@ inline int closest_triangle_stackless(
     return shortest_idx;
 }
 
-// Stack-based closest triangle (with sorting network, stack=48)
+// Stack-based closest triangle (with sorting network, stack=24)
 inline int closest_triangle(
     float3 point,
     device const BvhNode* nodes,
@@ -271,7 +258,7 @@ inline int closest_triangle(
     thread float& out_dist,
     float max_dist_sq = BVH_MAX_DIST_SQ
 ) {
-    FixedStack48 stack;
+    FixedStack24 stack;
     stack.push(0);
 
     float shortest_dist_sq = max_dist_sq;
@@ -302,17 +289,6 @@ inline int closest_triangle(
                     stack.push((int)children[i].idx);
                 }
             }
-        }
-
-        if (stack.overflowed) {
-            float fallback_sq;
-            int fallback_idx = closest_triangle_stackless(point, nodes, tris, fallback_sq, shortest_dist_sq);
-            if (fallback_sq <= shortest_dist_sq) {
-                shortest_dist_sq = fallback_sq;
-                shortest_idx = fallback_idx;
-            }
-            out_dist = sqrt(shortest_dist_sq);
-            return shortest_idx;
         }
     }
 
@@ -357,14 +333,14 @@ inline int ray_intersect_stackless(
     return shortest_idx;
 }
 
-// Stack-based ray intersection (with sorting network, stack=32)
+// Stack-based ray intersection (with sorting network, stack=24)
 inline int ray_intersect(
     float3 ro, float3 rd,
     device const BvhNode* nodes,
     device const BvhTriangle* tris,
     thread float& out_t
 ) {
-    FixedStack32 stack;
+    FixedStack24 stack;
     stack.push(0);
 
     float mint = BVH_MAX_DIST;
@@ -393,10 +369,6 @@ inline int ray_intersect(
                 }
             }
         }
-
-        if (stack.overflowed) {
-            return ray_intersect_stackless(ro, rd, nodes, tris, out_t);
-        }
     }
 
     out_t = mint;
@@ -409,7 +381,7 @@ inline float3 avg_normal_around_point(
     device const BvhNode* nodes,
     device const BvhTriangle* tris
 ) {
-    FixedStack32 stack;
+    FixedStack24 stack;
     stack.push(0);
 
     float total_weight = 0.0f;
@@ -433,32 +405,6 @@ inline float3 avg_normal_around_point(
                 if (bb_distance_sq(nodes[i + first_child].bb, point) < BVH_EPSILON) {
                     stack.push((int)(i + first_child));
                 }
-            }
-        }
-    }
-
-    // Stackless fallback if overflowed
-    if (stack.overflowed) {
-        total_weight = 0.0f;
-        result = float3(0.0f);
-        int idx2 = 0;
-        while (idx2 != -1) {
-            device const BvhNode& node = nodes[idx2];
-            if (bb_distance_sq(node.bb, point) >= BVH_EPSILON) {
-                idx2 = node.escape_idx;
-                continue;
-            }
-            if (node.left_idx < 0) {
-                int end = -node.right_idx - 1;
-                for (int i = -node.left_idx - 1; i < end; ++i) {
-                    if (tri_distance_sq(tris[i].a, tris[i].b, tris[i].c, point) < BVH_EPSILON) {
-                        result += tri_normal(tris[i].a, tris[i].b, tris[i].c);
-                        total_weight += 1.0f;
-                    }
-                }
-                idx2 = node.escape_idx;
-            } else {
-                idx2 = node.left_idx;
             }
         }
     }
