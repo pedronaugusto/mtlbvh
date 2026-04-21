@@ -475,131 +475,148 @@ inline float3 fibonacci_dir_32(uint i, float2 offset) {
 // ─── Global kernels ──────────────────────────────────────────────────────────
 // NOTE: PyTorch tensors are packed [N,3] float32 = 12 bytes per row.
 // Metal float3 is 16 bytes (padded). Use packed_float3 for tensor I/O.
+//
+// Dtype specialization: the 4 kernels below are macro-instantiated 3× each
+// (float / half / bfloat) parametrizing only the scalar output buffer
+// (distances or depth). Internal math always runs fp32 — only the final
+// store is narrowed. Vec3 inputs/outputs (positions/uvw/rays) stay
+// packed_float3 because Metal has no standard packed_half3 and per-component
+// narrowing isn't worth the complexity for a first round.
 
-kernel void unsigned_distance_kernel(
-    device const packed_float3* positions [[buffer(0)]],
-    device float* distances [[buffer(1)]],
-    device int64_t* face_id [[buffer(2)]],
-    device packed_float3* uvw [[buffer(3)]],
-    device const BvhNode* nodes [[buffer(4)]],
-    device const BvhTriangle* tris [[buffer(5)]],
-    constant uint& n_elements [[buffer(6)]],
-    constant uint& return_uvw [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= n_elements) return;
-
-    float3 point = float3(positions[tid]);
-    float dist;
-    int idx = closest_triangle(point, nodes, tris, dist);
-
-    distances[tid] = dist;
-    face_id[tid] = tris[idx].id;
-
-    if (return_uvw) {
-        float3 cp = tri_closest_point(tris[idx].a, tris[idx].b, tris[idx].c, point);
-        uvw[tid] = packed_float3(tri_barycentric(tris[idx].a, tris[idx].b, tris[idx].c, cp));
-    }
+#define UNSIGNED_DISTANCE_KERNEL(NAME, OUT_T)                        \
+kernel void NAME(                                                     \
+    device const packed_float3* positions [[buffer(0)]],             \
+    device OUT_T* distances               [[buffer(1)]],             \
+    device int64_t* face_id               [[buffer(2)]],             \
+    device packed_float3* uvw             [[buffer(3)]],             \
+    device const BvhNode* nodes           [[buffer(4)]],             \
+    device const BvhTriangle* tris        [[buffer(5)]],             \
+    constant uint& n_elements             [[buffer(6)]],             \
+    constant uint& return_uvw             [[buffer(7)]],             \
+    uint tid [[thread_position_in_grid]]                              \
+) {                                                                   \
+    if (tid >= n_elements) return;                                    \
+                                                                      \
+    float3 point = float3(positions[tid]);                            \
+    float dist;                                                       \
+    int idx = closest_triangle(point, nodes, tris, dist);             \
+                                                                      \
+    distances[tid] = (OUT_T)dist;                                     \
+    face_id[tid]   = tris[idx].id;                                    \
+                                                                      \
+    if (return_uvw) {                                                 \
+        float3 cp = tri_closest_point(tris[idx].a, tris[idx].b, tris[idx].c, point); \
+        uvw[tid] = packed_float3(tri_barycentric(tris[idx].a, tris[idx].b, tris[idx].c, cp)); \
+    }                                                                 \
 }
 
-kernel void signed_distance_watertight_kernel(
-    device const packed_float3* positions [[buffer(0)]],
-    device float* distances [[buffer(1)]],
-    device int64_t* face_id [[buffer(2)]],
-    device packed_float3* uvw [[buffer(3)]],
-    device const BvhNode* nodes [[buffer(4)]],
-    device const BvhTriangle* tris [[buffer(5)]],
-    constant uint& n_elements [[buffer(6)]],
-    constant uint& return_uvw [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= n_elements) return;
+UNSIGNED_DISTANCE_KERNEL(unsigned_distance_kernel,        float)
+UNSIGNED_DISTANCE_KERNEL(unsigned_distance_kernel_half,   half)
+UNSIGNED_DISTANCE_KERNEL(unsigned_distance_kernel_bfloat, bfloat)
 
-    float3 point = float3(positions[tid]);
-    float dist;
-    int idx = closest_triangle(point, nodes, tris, dist);
-
-    // Compute sign via normal averaging at closest point
-    float3 cp = tri_closest_point(tris[idx].a, tris[idx].b, tris[idx].c, point);
-    float3 avg_n = avg_normal_around_point(cp, nodes, tris);
-    float sign_val = dot(avg_n, point - cp) >= 0.0f ? 1.0f : -1.0f;
-
-    distances[tid] = sign_val * dist;
-    face_id[tid] = tris[idx].id;
-
-    if (return_uvw) {
-        uvw[tid] = packed_float3(tri_barycentric(tris[idx].a, tris[idx].b, tris[idx].c, cp));
-    }
+#define SIGNED_DISTANCE_WATERTIGHT_KERNEL(NAME, OUT_T)               \
+kernel void NAME(                                                     \
+    device const packed_float3* positions [[buffer(0)]],             \
+    device OUT_T* distances               [[buffer(1)]],             \
+    device int64_t* face_id               [[buffer(2)]],             \
+    device packed_float3* uvw             [[buffer(3)]],             \
+    device const BvhNode* nodes           [[buffer(4)]],             \
+    device const BvhTriangle* tris        [[buffer(5)]],             \
+    constant uint& n_elements             [[buffer(6)]],             \
+    constant uint& return_uvw             [[buffer(7)]],             \
+    uint tid [[thread_position_in_grid]]                              \
+) {                                                                   \
+    if (tid >= n_elements) return;                                    \
+                                                                      \
+    float3 point = float3(positions[tid]);                            \
+    float dist;                                                       \
+    int idx = closest_triangle(point, nodes, tris, dist);             \
+                                                                      \
+    float3 cp = tri_closest_point(tris[idx].a, tris[idx].b, tris[idx].c, point); \
+    float3 avg_n = avg_normal_around_point(cp, nodes, tris);          \
+    float sign_val = dot(avg_n, point - cp) >= 0.0f ? 1.0f : -1.0f;   \
+                                                                      \
+    distances[tid] = (OUT_T)(sign_val * dist);                        \
+    face_id[tid]   = tris[idx].id;                                    \
+                                                                      \
+    if (return_uvw) {                                                 \
+        uvw[tid] = packed_float3(tri_barycentric(tris[idx].a, tris[idx].b, tris[idx].c, cp)); \
+    }                                                                 \
 }
 
-kernel void signed_distance_raystab_kernel(
-    device const packed_float3* positions [[buffer(0)]],
-    device float* distances [[buffer(1)]],
-    device int64_t* face_id [[buffer(2)]],
-    device packed_float3* uvw [[buffer(3)]],
-    device const BvhNode* nodes [[buffer(4)]],
-    device const BvhTriangle* tris [[buffer(5)]],
-    constant uint& n_elements [[buffer(6)]],
-    constant uint& return_uvw [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= n_elements) return;
+SIGNED_DISTANCE_WATERTIGHT_KERNEL(signed_distance_watertight_kernel,        float)
+SIGNED_DISTANCE_WATERTIGHT_KERNEL(signed_distance_watertight_kernel_half,   half)
+SIGNED_DISTANCE_WATERTIGHT_KERNEL(signed_distance_watertight_kernel_bfloat, bfloat)
 
-    float3 point = float3(positions[tid]);
-    float dist;
-    int idx = closest_triangle(point, nodes, tris, dist);
-
-    // Ray stabbing for sign determination
-    pcg32 rng;
-    rng.advance((long)tid * 2);
-    float2 offset = float2(rng.next_float(), rng.next_float());
-
-    bool inside = true;
-    for (uint i = 0; i < BVH_N_STAB_RAYS; ++i) {
-        float3 d = fibonacci_dir_32(i, offset);
-        float t1, t2;
-        int hit1 = ray_intersect(point, -d, nodes, tris, t1);
-        int hit2 = ray_intersect(point, d, nodes, tris, t2);
-        if (hit1 < 0 || hit2 < 0) {
-            inside = false;
-            break;
-        }
-    }
-
-    distances[tid] = inside ? -dist : dist;
-    face_id[tid] = tris[idx].id;
-
-    if (return_uvw) {
-        float3 cp = tri_closest_point(tris[idx].a, tris[idx].b, tris[idx].c, point);
-        uvw[tid] = packed_float3(tri_barycentric(tris[idx].a, tris[idx].b, tris[idx].c, cp));
-    }
+#define SIGNED_DISTANCE_RAYSTAB_KERNEL(NAME, OUT_T)                  \
+kernel void NAME(                                                     \
+    device const packed_float3* positions [[buffer(0)]],             \
+    device OUT_T* distances               [[buffer(1)]],             \
+    device int64_t* face_id               [[buffer(2)]],             \
+    device packed_float3* uvw             [[buffer(3)]],             \
+    device const BvhNode* nodes           [[buffer(4)]],             \
+    device const BvhTriangle* tris        [[buffer(5)]],             \
+    constant uint& n_elements             [[buffer(6)]],             \
+    constant uint& return_uvw             [[buffer(7)]],             \
+    uint tid [[thread_position_in_grid]]                              \
+) {                                                                   \
+    if (tid >= n_elements) return;                                    \
+                                                                      \
+    float3 point = float3(positions[tid]);                            \
+    float dist;                                                       \
+    int idx = closest_triangle(point, nodes, tris, dist);             \
+                                                                      \
+    pcg32 rng;                                                        \
+    rng.advance((long)tid * 2);                                       \
+    float2 offset = float2(rng.next_float(), rng.next_float());       \
+                                                                      \
+    bool inside = true;                                               \
+    for (uint i = 0; i < BVH_N_STAB_RAYS; ++i) {                      \
+        float3 d = fibonacci_dir_32(i, offset);                       \
+        float t1, t2;                                                 \
+        int hit1 = ray_intersect(point, -d, nodes, tris, t1);         \
+        int hit2 = ray_intersect(point,  d, nodes, tris, t2);         \
+        if (hit1 < 0 || hit2 < 0) { inside = false; break; }          \
+    }                                                                 \
+                                                                      \
+    distances[tid] = (OUT_T)(inside ? -dist : dist);                  \
+    face_id[tid]   = tris[idx].id;                                    \
+                                                                      \
+    if (return_uvw) {                                                 \
+        float3 cp = tri_closest_point(tris[idx].a, tris[idx].b, tris[idx].c, point); \
+        uvw[tid] = packed_float3(tri_barycentric(tris[idx].a, tris[idx].b, tris[idx].c, cp)); \
+    }                                                                 \
 }
 
-kernel void raytrace_kernel(
-    device const packed_float3* rays_o [[buffer(0)]],
-    device const packed_float3* rays_d [[buffer(1)]],
-    device packed_float3* positions [[buffer(2)]],
-    device int64_t* face_id [[buffer(3)]],
-    device float* depth [[buffer(4)]],
-    device const BvhNode* nodes [[buffer(5)]],
-    device const BvhTriangle* tris [[buffer(6)]],
-    constant uint& n_elements [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= n_elements) return;
+SIGNED_DISTANCE_RAYSTAB_KERNEL(signed_distance_raystab_kernel,        float)
+SIGNED_DISTANCE_RAYSTAB_KERNEL(signed_distance_raystab_kernel_half,   half)
+SIGNED_DISTANCE_RAYSTAB_KERNEL(signed_distance_raystab_kernel_bfloat, bfloat)
 
-    float3 ro = float3(rays_o[tid]);
-    float3 rd = float3(rays_d[tid]);
-
-    float t;
-    int idx = ray_intersect(ro, rd, nodes, tris, t);
-
-    depth[tid] = t;
-    positions[tid] = packed_float3(ro + t * rd);
-
-    if (idx >= 0) {
-        face_id[tid] = tris[idx].id;
-    } else {
-        face_id[tid] = -1;
-    }
+#define RAYTRACE_KERNEL(NAME, OUT_T)                                 \
+kernel void NAME(                                                     \
+    device const packed_float3* rays_o    [[buffer(0)]],             \
+    device const packed_float3* rays_d    [[buffer(1)]],             \
+    device packed_float3* positions       [[buffer(2)]],             \
+    device int64_t* face_id               [[buffer(3)]],             \
+    device OUT_T* depth                   [[buffer(4)]],             \
+    device const BvhNode* nodes           [[buffer(5)]],             \
+    device const BvhTriangle* tris        [[buffer(6)]],             \
+    constant uint& n_elements             [[buffer(7)]],             \
+    uint tid [[thread_position_in_grid]]                              \
+) {                                                                   \
+    if (tid >= n_elements) return;                                    \
+                                                                      \
+    float3 ro = float3(rays_o[tid]);                                  \
+    float3 rd = float3(rays_d[tid]);                                  \
+                                                                      \
+    float t;                                                          \
+    int idx = ray_intersect(ro, rd, nodes, tris, t);                  \
+                                                                      \
+    depth[tid]     = (OUT_T)t;                                        \
+    positions[tid] = packed_float3(ro + t * rd);                      \
+    face_id[tid]   = (idx >= 0) ? tris[idx].id : (int64_t)-1;         \
 }
+
+RAYTRACE_KERNEL(raytrace_kernel,        float)
+RAYTRACE_KERNEL(raytrace_kernel_half,   half)
+RAYTRACE_KERNEL(raytrace_kernel_bfloat, bfloat)

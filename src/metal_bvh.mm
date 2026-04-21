@@ -80,7 +80,7 @@ MtlBVHImpl::MtlBVHImpl(const torch::Tensor& vertices, const torch::Tensor& trian
                                      length:bvh_tris.size() * sizeof(BvhTriangle)
                                     options:MTLResourceStorageModeShared];
 
-    // Pre-create all pipeline state objects
+    // Pre-create all pipeline state objects — 4 kernels × 3 output dtypes.
     auto make_pso = [&](const char* name) -> id<MTLComputePipelineState> {
         NSError* error = nil;
         id<MTLFunction> func = [library_ newFunctionWithName:
@@ -90,10 +90,31 @@ MtlBVHImpl::MtlBVHImpl(const torch::Tensor& vertices, const torch::Tensor& trian
         TORCH_CHECK(pso != nil, "[mtlbvh] Failed to create pipeline for: ", name);
         return pso;
     };
-    pso_unsigned_ = make_pso("unsigned_distance_kernel");
-    pso_signed_watertight_ = make_pso("signed_distance_watertight_kernel");
-    pso_signed_raystab_ = make_pso("signed_distance_raystab_kernel");
-    pso_raytrace_ = make_pso("raytrace_kernel");
+    // Dtype suffix lookup: fp32 → "" (backward-compat), fp16 → "_half", bf16 → "_bfloat".
+    // Arrays hold strong references (ARC) — unroll the outer loop so each
+    // assignment targets a named ivar rather than a pointer-to-pointer (which
+    // ARC rejects without explicit ownership qualifiers).
+    const char* suffixes[3] = {"", "_half", "_bfloat"};
+    for (int d = 0; d < 3; ++d) {
+        pso_unsigned_[d] = make_pso(
+            (std::string("unsigned_distance_kernel") + suffixes[d]).c_str());
+        pso_signed_watertight_[d] = make_pso(
+            (std::string("signed_distance_watertight_kernel") + suffixes[d]).c_str());
+        pso_signed_raystab_[d] = make_pso(
+            (std::string("signed_distance_raystab_kernel") + suffixes[d]).c_str());
+        pso_raytrace_[d] = make_pso(
+            (std::string("raytrace_kernel") + suffixes[d]).c_str());
+    }
+}
+
+// Resolve an OutDtype enum to a torch ScalarType for output-tensor allocation.
+static torch::ScalarType out_dtype_to_scalar(int out_dtype) {
+    switch (out_dtype) {
+        case MtlBVHImpl::kFp32: return torch::kFloat32;
+        case MtlBVHImpl::kFp16: return torch::kFloat16;
+        case MtlBVHImpl::kBf16: return torch::kBFloat16;
+    }
+    TORCH_CHECK(false, "[mtlbvh] Invalid out_dtype (expected 0/1/2): ", out_dtype);
 }
 
 // ─── Helper: create Metal buffer from tensor (zero-copy on Apple Silicon) ────
@@ -156,7 +177,7 @@ static void dispatch_query(id<MTLDevice> dev, id<MTLCommandQueue> queue,
 // ─── Unsigned distance ──────────────────────────────────────────────────────
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
+MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw, int out_dtype) {
     bool on_mps = positions.device().is_mps();
     auto dev_opts = torch::TensorOptions().device(positions.device());
 
@@ -167,7 +188,8 @@ MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
 
     pos_f = pos_f.view({N, 3});
 
-    auto distances = torch::empty({N}, dev_opts.dtype(torch::kFloat32));
+    auto out_scalar = out_dtype_to_scalar(out_dtype);
+    auto distances = torch::empty({N}, dev_opts.dtype(out_scalar));
     auto face_id = torch::empty({N}, dev_opts.dtype(torch::kInt64));
     // zeros({1,3}) is unused when !return_uvw but buffer index 3 still needs
     // a valid binding. Build on CPU and move — some PyTorch MPS builds have a
@@ -189,7 +211,7 @@ MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
     auto fid_buf = tensor_to_buffer(device_, face_id);
     auto uvw_buf = tensor_to_buffer(device_, uvw);
 
-    auto pso = pso_unsigned_;
+    auto pso = pso_unsigned_[out_dtype];
     NSUInteger tw = pso.threadExecutionWidth;
     dispatch_query(device_, queue_, pso, on_mps, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:pos_buf.buffer  offset:pos_buf.offset  atIndex:0];
@@ -220,7 +242,7 @@ MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
 // ─── Signed distance ────────────────────────────────────────────────────────
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int mode) {
+MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int mode, int out_dtype) {
     bool on_mps = positions.device().is_mps();
     auto dev_opts = torch::TensorOptions().device(positions.device());
 
@@ -231,7 +253,8 @@ MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int
 
     pos_f = pos_f.view({N, 3});
 
-    auto distances = torch::empty({N}, dev_opts.dtype(torch::kFloat32));
+    auto out_scalar = out_dtype_to_scalar(out_dtype);
+    auto distances = torch::empty({N}, dev_opts.dtype(out_scalar));
     auto face_id = torch::empty({N}, dev_opts.dtype(torch::kInt64));
     // zeros({1,3}) is unused when !return_uvw but buffer index 3 still needs
     // a valid binding. Build on CPU and move — some PyTorch MPS builds have a
@@ -253,7 +276,8 @@ MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int
     auto fid_buf = tensor_to_buffer(device_, face_id);
     auto uvw_buf = tensor_to_buffer(device_, uvw);
 
-    auto pso = (mode == 0) ? pso_signed_watertight_ : pso_signed_raystab_;
+    auto pso = (mode == 0) ? pso_signed_watertight_[out_dtype]
+                            : pso_signed_raystab_[out_dtype];
     NSUInteger tw = pso.threadExecutionWidth;
     dispatch_query(device_, queue_, pso, on_mps, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:pos_buf.buffer  offset:pos_buf.offset  atIndex:0];
@@ -283,7 +307,7 @@ MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int
 // ─── Ray trace ──────────────────────────────────────────────────────────────
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-MtlBVHImpl::ray_trace(const torch::Tensor& rays_o, const torch::Tensor& rays_d) {
+MtlBVHImpl::ray_trace(const torch::Tensor& rays_o, const torch::Tensor& rays_d, int out_dtype) {
     bool on_mps = rays_o.device().is_mps();
     auto dev_opts = torch::TensorOptions().device(rays_o.device());
 
@@ -297,9 +321,10 @@ MtlBVHImpl::ray_trace(const torch::Tensor& rays_o, const torch::Tensor& rays_d) 
     ro_f = ro_f.view({N, 3});
     rd_f = rd_f.view({N, 3});
 
+    auto out_scalar = out_dtype_to_scalar(out_dtype);
     auto positions = torch::empty({N, 3}, dev_opts.dtype(torch::kFloat32));
     auto face_id = torch::empty({N}, dev_opts.dtype(torch::kInt64));
-    auto depth = torch::empty({N}, dev_opts.dtype(torch::kFloat32));
+    auto depth = torch::empty({N}, dev_opts.dtype(out_scalar));
 
     uint32_t n_elements = (uint32_t)N;
 
@@ -309,7 +334,7 @@ MtlBVHImpl::ray_trace(const torch::Tensor& rays_o, const torch::Tensor& rays_d) 
     auto fid_buf = tensor_to_buffer(device_, face_id);
     auto dep_buf = tensor_to_buffer(device_, depth);
 
-    auto pso = pso_raytrace_;
+    auto pso = pso_raytrace_[out_dtype];
     NSUInteger tw = pso.threadExecutionWidth;
     dispatch_query(device_, queue_, pso, on_mps, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:ro_buf.buffer  offset:ro_buf.offset  atIndex:0];
