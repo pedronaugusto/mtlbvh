@@ -10,6 +10,18 @@
 #define MTLBVH_HAS_MPS 0
 #endif
 
+#if MTLBVH_HAS_MPS
+#import <ATen/mps/MPSStream.h>
+// Forward-declare this — defined in ATen/native/mps/OperationUtils.h but that
+// header pulls in non-ARC MPS graph headers. The function is a one-line
+// bit-cast of the storage pointer to MTLBuffer.
+namespace at { namespace native { namespace mps {
+static inline id<MTLBuffer> getMTLBufferStorage(const at::TensorBase& tensor) {
+    return __builtin_bit_cast(id<MTLBuffer>, tensor.storage().data());
+}
+}}}
+#endif
+
 static void _mtlbvh_anchor() {}
 
 // ─── Construction ────────────────────────────────────────────────────────────
@@ -86,21 +98,68 @@ MtlBVHImpl::MtlBVHImpl(const torch::Tensor& vertices, const torch::Tensor& trian
 
 // ─── Helper: create Metal buffer from tensor (zero-copy on Apple Silicon) ────
 
-static id<MTLBuffer> tensor_to_buffer(id<MTLDevice> dev, const torch::Tensor& t) {
-    size_t nbytes = t.nbytes();
-    TORCH_CHECK(nbytes > 0, "[mtlbvh] empty tensor");
+// Returns (buffer, offset). `offset` accounts for non-zero storage_offset on
+// MPS tensors, which view operations produce. CPU tensors always have offset 0
+// because we create fresh buffers from contiguous storage.
+struct TensorBuf { id<MTLBuffer> buffer; NSUInteger offset; };
+
+static TensorBuf tensor_to_buffer(id<MTLDevice> dev, const torch::Tensor& t) {
+    TORCH_CHECK(t.numel() > 0, "[mtlbvh] empty tensor");
+#if MTLBVH_HAS_MPS
+    if (t.device().is_mps()) {
+        id<MTLBuffer> buf = at::native::mps::getMTLBufferStorage(t);
+        TORCH_CHECK(buf != nil, "[mtlbvh] Failed to get MPS MTLBuffer");
+        NSUInteger offset = (NSUInteger)t.storage_offset() * t.element_size();
+        return {buf, offset};
+    }
+#endif
     id<MTLBuffer> buf = [dev newBufferWithBytesNoCopy:t.data_ptr()
-                                               length:nbytes
+                                               length:t.nbytes()
                                               options:MTLResourceStorageModeShared
                                           deallocator:nil];
     TORCH_CHECK(buf != nil, "[mtlbvh] Failed to create buffer");
-    return buf;
+    return {buf, 0};
+}
+
+// Dispatch a pre-built command setup. On MPS, encodes into PyTorch's active
+// MPSStream and returns without waiting (PyTorch commits at its next sync
+// point). On CPU, commits and waits synchronously since the output tensor's
+// storage must be valid on return.
+static void dispatch_query(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                           id<MTLComputePipelineState> pso,
+                           bool on_mps,
+                           void (^encode)(id<MTLComputeCommandEncoder>)) {
+#if MTLBVH_HAS_MPS
+    if (on_mps) {
+        auto* stream = at::mps::getCurrentMPSStream();
+        at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
+                id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+                [enc setComputePipelineState:pso];
+                encode(enc);
+                [enc endEncoding];
+            }
+        });
+        return;
+    }
+#endif
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    encode(enc);
+    [enc endEncoding];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
 }
 
 // ─── Unsigned distance ──────────────────────────────────────────────────────
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
+    bool on_mps = positions.device().is_mps();
+    auto dev_opts = torch::TensorOptions().device(positions.device());
+
     auto pos_f = positions.detach().contiguous().to(torch::kFloat32);
     auto prefix = pos_f.sizes().vec();
     prefix.pop_back();  // remove last dim (3)
@@ -108,9 +167,19 @@ MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
 
     pos_f = pos_f.view({N, 3});
 
-    auto distances = torch::empty({N}, torch::kFloat32);
-    auto face_id = torch::empty({N}, torch::kInt64);
-    auto uvw = return_uvw ? torch::empty({N, 3}, torch::kFloat32) : torch::zeros({1, 3}, torch::kFloat32);
+    auto distances = torch::empty({N}, dev_opts.dtype(torch::kFloat32));
+    auto face_id = torch::empty({N}, dev_opts.dtype(torch::kInt64));
+    // zeros({1,3}) is unused when !return_uvw but buffer index 3 still needs
+    // a valid binding. Build on CPU and move — some PyTorch MPS builds have a
+    // broken torch::zeros fp32 MPS kernel (DispatchStub missing).
+    torch::Tensor uvw;
+    if (return_uvw) {
+        uvw = torch::empty({N, 3}, dev_opts.dtype(torch::kFloat32));
+    } else if (on_mps) {
+        uvw = torch::zeros({1, 3}, torch::kFloat32).to(positions.device());
+    } else {
+        uvw = torch::zeros({1, 3}, torch::kFloat32);
+    }
 
     uint32_t n_elements = (uint32_t)N;
     uint32_t ret_uvw = return_uvw ? 1 : 0;
@@ -121,23 +190,18 @@ MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
     auto uvw_buf = tensor_to_buffer(device_, uvw);
 
     auto pso = pso_unsigned_;
-    id<MTLCommandBuffer> cmdBuf = [queue_ commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:pos_buf    offset:0 atIndex:0];
-    [enc setBuffer:dist_buf   offset:0 atIndex:1];
-    [enc setBuffer:fid_buf    offset:0 atIndex:2];
-    [enc setBuffer:uvw_buf    offset:0 atIndex:3];
-    [enc setBuffer:nodes_buf_ offset:0 atIndex:4];
-    [enc setBuffer:tris_buf_  offset:0 atIndex:5];
-    [enc setBytes:&n_elements length:sizeof(uint32_t) atIndex:6];
-    [enc setBytes:&ret_uvw    length:sizeof(uint32_t) atIndex:7];
-
     NSUInteger tw = pso.threadExecutionWidth;
-    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    dispatch_query(device_, queue_, pso, on_mps, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:pos_buf.buffer  offset:pos_buf.offset  atIndex:0];
+        [enc setBuffer:dist_buf.buffer offset:dist_buf.offset atIndex:1];
+        [enc setBuffer:fid_buf.buffer  offset:fid_buf.offset  atIndex:2];
+        [enc setBuffer:uvw_buf.buffer  offset:uvw_buf.offset  atIndex:3];
+        [enc setBuffer:nodes_buf_ offset:0 atIndex:4];
+        [enc setBuffer:tris_buf_  offset:0 atIndex:5];
+        [enc setBytes:&n_elements length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&ret_uvw    length:sizeof(uint32_t) atIndex:7];
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    });
 
     // Reshape outputs back to original prefix shape
     distances = distances.view(prefix);
@@ -157,6 +221,9 @@ MtlBVHImpl::unsigned_distance(const torch::Tensor& positions, bool return_uvw) {
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int mode) {
+    bool on_mps = positions.device().is_mps();
+    auto dev_opts = torch::TensorOptions().device(positions.device());
+
     auto pos_f = positions.detach().contiguous().to(torch::kFloat32);
     auto prefix = pos_f.sizes().vec();
     prefix.pop_back();
@@ -164,9 +231,19 @@ MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int
 
     pos_f = pos_f.view({N, 3});
 
-    auto distances = torch::empty({N}, torch::kFloat32);
-    auto face_id = torch::empty({N}, torch::kInt64);
-    auto uvw = return_uvw ? torch::empty({N, 3}, torch::kFloat32) : torch::zeros({1, 3}, torch::kFloat32);
+    auto distances = torch::empty({N}, dev_opts.dtype(torch::kFloat32));
+    auto face_id = torch::empty({N}, dev_opts.dtype(torch::kInt64));
+    // zeros({1,3}) is unused when !return_uvw but buffer index 3 still needs
+    // a valid binding. Build on CPU and move — some PyTorch MPS builds have a
+    // broken torch::zeros fp32 MPS kernel (DispatchStub missing).
+    torch::Tensor uvw;
+    if (return_uvw) {
+        uvw = torch::empty({N, 3}, dev_opts.dtype(torch::kFloat32));
+    } else if (on_mps) {
+        uvw = torch::zeros({1, 3}, torch::kFloat32).to(positions.device());
+    } else {
+        uvw = torch::zeros({1, 3}, torch::kFloat32);
+    }
 
     uint32_t n_elements = (uint32_t)N;
     uint32_t ret_uvw = return_uvw ? 1 : 0;
@@ -177,23 +254,18 @@ MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int
     auto uvw_buf = tensor_to_buffer(device_, uvw);
 
     auto pso = (mode == 0) ? pso_signed_watertight_ : pso_signed_raystab_;
-    id<MTLCommandBuffer> cmdBuf = [queue_ commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:pos_buf    offset:0 atIndex:0];
-    [enc setBuffer:dist_buf   offset:0 atIndex:1];
-    [enc setBuffer:fid_buf    offset:0 atIndex:2];
-    [enc setBuffer:uvw_buf    offset:0 atIndex:3];
-    [enc setBuffer:nodes_buf_ offset:0 atIndex:4];
-    [enc setBuffer:tris_buf_  offset:0 atIndex:5];
-    [enc setBytes:&n_elements length:sizeof(uint32_t) atIndex:6];
-    [enc setBytes:&ret_uvw    length:sizeof(uint32_t) atIndex:7];
-
     NSUInteger tw = pso.threadExecutionWidth;
-    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    dispatch_query(device_, queue_, pso, on_mps, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:pos_buf.buffer  offset:pos_buf.offset  atIndex:0];
+        [enc setBuffer:dist_buf.buffer offset:dist_buf.offset atIndex:1];
+        [enc setBuffer:fid_buf.buffer  offset:fid_buf.offset  atIndex:2];
+        [enc setBuffer:uvw_buf.buffer  offset:uvw_buf.offset  atIndex:3];
+        [enc setBuffer:nodes_buf_ offset:0 atIndex:4];
+        [enc setBuffer:tris_buf_  offset:0 atIndex:5];
+        [enc setBytes:&n_elements length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&ret_uvw    length:sizeof(uint32_t) atIndex:7];
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    });
 
     distances = distances.view(prefix);
     face_id = face_id.view(prefix);
@@ -212,6 +284,9 @@ MtlBVHImpl::signed_distance(const torch::Tensor& positions, bool return_uvw, int
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 MtlBVHImpl::ray_trace(const torch::Tensor& rays_o, const torch::Tensor& rays_d) {
+    bool on_mps = rays_o.device().is_mps();
+    auto dev_opts = torch::TensorOptions().device(rays_o.device());
+
     auto ro_f = rays_o.detach().contiguous().to(torch::kFloat32);
     auto rd_f = rays_d.detach().contiguous().to(torch::kFloat32);
 
@@ -222,9 +297,9 @@ MtlBVHImpl::ray_trace(const torch::Tensor& rays_o, const torch::Tensor& rays_d) 
     ro_f = ro_f.view({N, 3});
     rd_f = rd_f.view({N, 3});
 
-    auto positions = torch::empty({N, 3}, torch::kFloat32);
-    auto face_id = torch::empty({N}, torch::kInt64);
-    auto depth = torch::empty({N}, torch::kFloat32);
+    auto positions = torch::empty({N, 3}, dev_opts.dtype(torch::kFloat32));
+    auto face_id = torch::empty({N}, dev_opts.dtype(torch::kInt64));
+    auto depth = torch::empty({N}, dev_opts.dtype(torch::kFloat32));
 
     uint32_t n_elements = (uint32_t)N;
 
@@ -235,23 +310,18 @@ MtlBVHImpl::ray_trace(const torch::Tensor& rays_o, const torch::Tensor& rays_d) 
     auto dep_buf = tensor_to_buffer(device_, depth);
 
     auto pso = pso_raytrace_;
-    id<MTLCommandBuffer> cmdBuf = [queue_ commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:ro_buf     offset:0 atIndex:0];
-    [enc setBuffer:rd_buf     offset:0 atIndex:1];
-    [enc setBuffer:pos_buf    offset:0 atIndex:2];
-    [enc setBuffer:fid_buf    offset:0 atIndex:3];
-    [enc setBuffer:dep_buf    offset:0 atIndex:4];
-    [enc setBuffer:nodes_buf_ offset:0 atIndex:5];
-    [enc setBuffer:tris_buf_  offset:0 atIndex:6];
-    [enc setBytes:&n_elements length:sizeof(uint32_t) atIndex:7];
-
     NSUInteger tw = pso.threadExecutionWidth;
-    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    dispatch_query(device_, queue_, pso, on_mps, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:ro_buf.buffer  offset:ro_buf.offset  atIndex:0];
+        [enc setBuffer:rd_buf.buffer  offset:rd_buf.offset  atIndex:1];
+        [enc setBuffer:pos_buf.buffer offset:pos_buf.offset atIndex:2];
+        [enc setBuffer:fid_buf.buffer offset:fid_buf.offset atIndex:3];
+        [enc setBuffer:dep_buf.buffer offset:dep_buf.offset atIndex:4];
+        [enc setBuffer:nodes_buf_ offset:0 atIndex:5];
+        [enc setBuffer:tris_buf_  offset:0 atIndex:6];
+        [enc setBytes:&n_elements length:sizeof(uint32_t) atIndex:7];
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    });
 
     auto pos_shape = prefix;
     pos_shape.push_back(3);

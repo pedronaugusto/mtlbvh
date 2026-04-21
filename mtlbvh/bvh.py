@@ -1,7 +1,12 @@
 """Python wrapper for MtlBVH — Metal-accelerated BVH queries."""
 import torch
-import numpy as np
 from . import _C
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
 
 _sdf_mode_to_id = {
     'watertight': 0,
@@ -20,20 +25,26 @@ class MtlBVH:
             vertices: [N, 3] float32 (numpy or torch)
             triangles: [M, 3] int32 (numpy or torch)
         """
-        if torch.is_tensor(vertices):
-            vertices = vertices.detach().cpu().numpy()
-        if torch.is_tensor(triangles):
-            triangles = triangles.detach().cpu().numpy()
+        # Normalize to torch tensors on CPU. The C++ constructor already pulls
+        # inputs to CPU for the CPU-side BVH build; accept numpy only when
+        # NumPy is available (some PyTorch builds compile without it).
+        if not torch.is_tensor(vertices):
+            if _HAS_NUMPY:
+                vertices = torch.from_numpy(np.ascontiguousarray(vertices, dtype=np.float32))
+            else:
+                vertices = torch.tensor(vertices, dtype=torch.float32)
+        if not torch.is_tensor(triangles):
+            if _HAS_NUMPY:
+                triangles = torch.from_numpy(np.ascontiguousarray(triangles, dtype=np.int32))
+            else:
+                triangles = torch.tensor(triangles, dtype=torch.int32)
 
-        vertices = np.ascontiguousarray(vertices, dtype=np.float32)
-        triangles = np.ascontiguousarray(triangles, dtype=np.int32)
+        vertices = vertices.detach().to(torch.float32).contiguous()
+        triangles = triangles.detach().to(torch.int32).contiguous()
 
         assert triangles.shape[0] > 8, f"BVH needs at least 8 triangles, got {triangles.shape[0]}"
 
-        self._impl = _C.MtlBVH(
-            torch.from_numpy(vertices),
-            torch.from_numpy(triangles),
-        )
+        self._impl = _C.MtlBVH(vertices, triangles)
 
     def unsigned_distance(self, positions, return_uvw=False):
         """Compute unsigned distance to mesh surface.
