@@ -396,3 +396,117 @@ class TestDegenerateTriangles:
         assert uvw is not None
         assert not torch.isnan(uvw).any(), f"NaN in barycentrics: {uvw}"
         assert not torch.isinf(uvw).any(), f"Inf in barycentrics: {uvw}"
+
+
+# ---------------------------------------------------------------------------
+# Deep-BVH traversal (regression: traversal stack depth)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def deep_mesh():
+    """~500K-triangle grid — BVH4 depth ~10, needing ~31 stack slots.
+
+    Deliberately larger than the ~8-deep trees the other fixtures build: at
+    3*depth+1 max occupancy, anything past depth 8 overflows a 24-slot stack.
+    """
+    n = 500  # 500x500 grid -> 2*499*499 = 498,002 triangles
+    xs, ys = np.meshgrid(
+        np.linspace(-1, 1, n).astype(np.float32),
+        np.linspace(-1, 1, n).astype(np.float32),
+        indexing="ij",
+    )
+    # Non-planar so the BVH can't collapse into a degenerate flat split
+    zs = (0.3 * np.sin(4 * xs) * np.cos(4 * ys)).astype(np.float32)
+    verts = np.stack([xs.ravel(), ys.ravel(), zs.ravel()], axis=1)
+
+    i, j = np.meshgrid(np.arange(n - 1), np.arange(n - 1), indexing="ij")
+    v00 = (i * n + j).ravel()
+    v01 = (i * n + j + 1).ravel()
+    v10 = ((i + 1) * n + j).ravel()
+    v11 = ((i + 1) * n + j + 1).ravel()
+    tris = np.concatenate([
+        np.stack([v00, v10, v11], axis=1),
+        np.stack([v00, v11, v01], axis=1),
+    ]).astype(np.int32)
+    return verts, tris
+
+
+class TestDeepBvhTraversal:
+    """Regression for the fixed-size traversal stack.
+
+    A 4-ary BVH pushes up to 4 children per pop, so peak occupancy is
+    ~3*depth+1. The stack used to be 24 deep and silently DROPPED pushes past
+    that (`if (count < 24) ...`), so entire subtrees went unvisited. Queries
+    still returned a plausible-looking positive number — they just skipped the
+    true nearest primitive and over-estimated distance. That is what corrupted
+    the narrow-band UDF and made downstream remeshing holey.
+    """
+
+    def test_distance_at_vertices_is_zero(self, deep_mesh):
+        """A query exactly AT a surface vertex must return distance ~0.
+
+        This is the sharpest form of the bug: with a too-small stack the
+        subtree containing the coincident triangle is dropped and the query
+        reports a nonzero distance while standing on the surface.
+        """
+        from mtlbvh import MtlBVH
+        v, t = deep_mesh
+        bvh = MtlBVH(v, t)
+
+        rng = np.random.default_rng(0)
+        idx = rng.choice(len(v), size=2000, replace=False)
+        pts = torch.from_numpy(v[idx])
+
+        d, fid, _ = bvh.unsigned_distance(pts)
+        worst = d.abs().max().item()
+        assert worst < 1e-4, (
+            f"distance at on-surface vertices should be ~0, got max {worst:.6f} "
+            f"({int((d.abs() > 1e-4).sum())}/{len(d)} vertices wrong) — "
+            f"traversal stack is dropping subtrees"
+        )
+        assert (fid >= 0).all(), "every on-surface query must hit a face"
+
+    def test_deep_mesh_parity_with_brute_force(self, deep_mesh):
+        """Off-surface queries must still match an O(T) brute-force scan."""
+        from mtlbvh import MtlBVH
+        v, t = deep_mesh
+        bvh = MtlBVH(v, t)
+
+        rng = np.random.default_rng(1)
+        pts = (rng.random((24, 3)).astype(np.float32) * 2.4) - 1.2
+        d_bvh, _, _ = bvh.unsigned_distance(torch.from_numpy(pts))
+
+        # Vectorised brute force — 500K triangles is too many for the per-tri loop
+        a = v[t[:, 0]]
+        b = v[t[:, 1]]
+        c = v[t[:, 2]]
+        for i, p in enumerate(pts):
+            dsq = _point_triangle_distance_sq_batch(p, a, b, c)
+            d_ref = float(np.sqrt(dsq.min()))
+            assert abs(d_bvh[i].item() - d_ref) < 1e-3, (
+                f"point {i}: bvh={d_bvh[i].item():.6f} ref={d_ref:.6f} — "
+                f"traversal stack is dropping subtrees"
+            )
+
+
+def _point_triangle_distance_sq_batch(p, a, b, c):
+    """Vectorised point-triangle squared distance over all triangles at once."""
+    v21 = b - a; p1 = p - a
+    v32 = c - b; p2 = p - b
+    v13 = a - c; p3 = p - c
+    nor = np.cross(v21, v13)
+
+    s1 = np.sign((np.cross(v21, nor) * p1).sum(-1))
+    s2 = np.sign((np.cross(v32, nor) * p2).sum(-1))
+    s3 = np.sign((np.cross(v13, nor) * p3).sum(-1))
+    edge_case = (s1 + s2 + s3) < 2.0
+
+    def _edge(vv, pp):
+        t = np.clip((vv * pp).sum(-1) / np.maximum((vv * vv).sum(-1), 1e-30), 0, 1)
+        e = vv * t[:, None] - pp
+        return (e * e).sum(-1)
+
+    d_edge = np.minimum(np.minimum(_edge(v21, p1), _edge(v32, p2)), _edge(v13, p3))
+    dn = (nor * p1).sum(-1)
+    d_face = dn * dn / np.maximum((nor * nor).sum(-1), 1e-30)
+    return np.where(edge_case, d_edge, d_face)
