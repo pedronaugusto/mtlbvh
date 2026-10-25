@@ -16,7 +16,7 @@ API-compatible with [cubvh](https://github.com/ashawkey/cubvh) for drop-in use i
 
 ## Installation
 
-Requires macOS with Apple Silicon, Xcode command line tools, and PyTorch >= 2.0.
+Requires macOS 14+ on Apple Silicon, Xcode command line tools, and PyTorch >= 2.0.
 
 ```bash
 pip install --no-build-isolation -e .
