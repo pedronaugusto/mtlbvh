@@ -165,13 +165,15 @@ static void dispatch_query(id<MTLDevice> dev, id<MTLCommandQueue> queue,
         return;
     }
 #endif
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    encode(enc);
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        encode(enc);
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+    }
 }
 
 // ─── Unsigned distance ──────────────────────────────────────────────────────
